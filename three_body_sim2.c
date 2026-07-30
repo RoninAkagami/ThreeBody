@@ -33,7 +33,6 @@ typedef int socket_t;
 #define BODY_MASS          1250.0
 #define DT                 0.25
 #define SUBSTEPS           2
-#define MAX_DISTANCE       5000.0
 #define MAX_FRAMES         100000
 
 #define DEFAULT_WIDTH      1000
@@ -42,7 +41,8 @@ typedef int socket_t;
 
 typedef enum {
     INTEGRATOR_LEGACY = 0,
-    INTEGRATOR_RK4 = 1
+    INTEGRATOR_VERLET = 1,
+    INTEGRATOR_RK4 = 2
 } IntegratorMode;
 
 typedef enum {
@@ -76,6 +76,31 @@ static double calc_total_distance(const double bodies[3][4]) {
     double d2 = hypot(bodies[1][0] - bodies[2][0], bodies[1][1] - bodies[2][1]);
     double d3 = hypot(bodies[2][0] - bodies[0][0], bodies[2][1] - bodies[0][1]);
     return d1 + d2 + d3;
+}
+
+static int has_escaped(const double bodies[3][4]) {
+    double dx1 = bodies[2][0] - bodies[0][0];
+    double dy1 = bodies[2][1] - bodies[0][1];
+    double dx2 = bodies[2][0] - bodies[1][0];
+    double dy2 = bodies[2][1] - bodies[1][1];
+    double r1 = hypot(dx1, dy1);
+    double r2 = hypot(dx2, dy2);
+    if (r1 < 1.0) r1 = 1.0;
+    if (r2 < 1.0) r2 = 1.0;
+
+    double rel_vx = bodies[2][2] - 0.5 * (bodies[0][2] + bodies[1][2]);
+    double rel_vy = bodies[2][3] - 0.5 * (bodies[0][3] + bodies[1][3]);
+    double kinetic = 0.5 * (rel_vx * rel_vx + rel_vy * rel_vy);
+    double potential = -G * (1.0 / r1 + 1.0 / r2);
+    double energy = kinetic + potential;
+
+    double com_x = 0.5 * (bodies[0][0] + bodies[1][0]);
+    double com_y = 0.5 * (bodies[0][1] + bodies[1][1]);
+    double rel_x = bodies[2][0] - com_x;
+    double rel_y = bodies[2][1] - com_y;
+    double radial_velocity = rel_x * rel_vx + rel_y * rel_vy;
+
+    return energy > 0.0 && radial_velocity > 0.0;
 }
 
 static void accelerations_from_positions(const double pos[3][2], double acc[3][2]) {
@@ -112,6 +137,33 @@ static void update_positions_legacy(double bodies[3][4]) {
     for (int i = 0; i < 3; ++i) {
         bodies[i][0] += bodies[i][2] * DT;
         bodies[i][1] += bodies[i][3] * DT;
+    }
+}
+
+static void compute_accelerations(const double double_bodies[3][4], double acc[3][2]) {
+    double pos[3][2];
+    for (int i = 0; i < 3; ++i) {
+        pos[i][0] = double_bodies[i][0];
+        pos[i][1] = double_bodies[i][1];
+    }
+    accelerations_from_positions(pos, acc);
+}
+
+static void velocity_verlet_step(double bodies[3][4], double dt) {
+    double acc[3][2];
+    double next_acc[3][2];
+    compute_accelerations(bodies, acc);
+
+    for (int i = 0; i < 3; ++i) {
+        bodies[i][0] += bodies[i][2] * dt + 0.5 * acc[i][0] * dt * dt;
+        bodies[i][1] += bodies[i][3] * dt + 0.5 * acc[i][1] * dt * dt;
+    }
+
+    compute_accelerations(bodies, next_acc);
+
+    for (int i = 0; i < 3; ++i) {
+        bodies[i][2] += 0.5 * (acc[i][0] + next_acc[i][0]) * dt;
+        bodies[i][3] += 0.5 * (acc[i][1] + next_acc[i][1]) * dt;
     }
 }
 
@@ -170,12 +222,14 @@ static int run_one_simulation(double x3, double y3, const SimParams *p) {
         for (int s = 0; s < SUBSTEPS; ++s) {
             if (p->integrator == INTEGRATOR_RK4) {
                 rk4_step(bodies, DT);
+            } else if (p->integrator == INTEGRATOR_VERLET) {
+                velocity_verlet_step(bodies, DT);
             } else {
                 compute_forces_legacy(bodies);
                 update_positions_legacy(bodies);
             }
         }
-        if (calc_total_distance(bodies) > MAX_DISTANCE) {
+        if (has_escaped(bodies)) {
             return frame + 1;
         }
     }
@@ -398,13 +452,16 @@ static int render_data(const SimParams *params, Buffer *text) {
     double x_step = (params->width <= 1) ? 0.0 : (params->xmax - params->xmin) / (double)(params->width - 1);
     double y_step = (params->height <= 1) ? 0.0 : (params->ymax - params->ymin) / (double)(params->height - 1);
 
+    const char *integrator_name = "legacy";
+    if (params->integrator == INTEGRATOR_RK4) integrator_name = "rk4";
+    else if (params->integrator == INTEGRATOR_VERLET) integrator_name = "verlet";
+
     int ok = append_printf(text, "# three-body simulation result\n") &&
              append_printf(text, "# format: x/y=survived_frames\n") &&
              append_printf(text, "# range: xmin=%g ymin=%g xmax=%g ymax=%g\n",
                            params->xmin, params->ymin, params->xmax, params->ymax) &&
              append_printf(text, "# size: width=%d height=%d\n", params->width, params->height) &&
-             append_printf(text, "# integrator: %s\n\n",
-                           params->integrator == INTEGRATOR_RK4 ? "rk4" : "legacy");
+             append_printf(text, "# integrator: %s\n\n", integrator_name);
 
     for (int row = 0; ok && row < params->height; ++row) {
         double y3 = params->ymax - row * y_step;
@@ -472,7 +529,7 @@ static SimParams default_params(void) {
     p.ymax = 500.0;
     p.width = DEFAULT_WIDTH;
     p.height = DEFAULT_HEIGHT;
-    p.integrator = INTEGRATOR_LEGACY;
+    p.integrator = INTEGRATOR_VERLET;
     p.output = OUTPUT_PNG;
     return p;
 }
@@ -494,6 +551,7 @@ static SimParams parse_params(const char *request) {
     query_int(request, "height", &p.height);
 
     if (query_token_equals(request, "integrator", "rk4")) p.integrator = INTEGRATOR_RK4;
+    if (query_token_equals(request, "integrator", "verlet")) p.integrator = INTEGRATOR_VERLET;
     if (query_token_equals(request, "integrator", "legacy")) p.integrator = INTEGRATOR_LEGACY;
     if (query_token_equals(request, "output", "data")) p.output = OUTPUT_DATA;
     if (query_token_equals(request, "output", "png")) p.output = OUTPUT_PNG;
@@ -579,12 +637,16 @@ static void handle_client(socket_t client) {
         return;
     }
 
+    const char *integrator_name = "legacy";
+    if (params.integrator == INTEGRATOR_RK4) integrator_name = "rk4";
+    else if (params.integrator == INTEGRATOR_VERLET) integrator_name = "verlet";
+
     fprintf(stderr,
             "render y2=%g vx2=%g vy2=%g vx3=%g vy3=%g range=(%g,%g)-(%g,%g) size=%dx%d integrator=%s output=%s\n",
             params.y2, params.vx2, params.vy2, params.vx3, params.vy3,
             params.xmin, params.ymin, params.xmax, params.ymax,
             params.width, params.height,
-            params.integrator == INTEGRATOR_RK4 ? "rk4" : "legacy",
+            integrator_name,
             params.output == OUTPUT_DATA ? "data" : "png");
 
     Buffer out = {0};
